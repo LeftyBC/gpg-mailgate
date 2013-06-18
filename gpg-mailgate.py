@@ -18,29 +18,44 @@ for sect in _cfg.sections():
 	for (name, value) in _cfg.items(sect):
 		cfg[sect][name] = value
 
+
+if cfg.has_key('default') and cfg['default'].has_key('recipient_delimiter'):
+	recipient_delimiter = cfg['default']['recipient_delimiter']
+else:
+	recipient_delimiter = None
+
 # Read e-mail from stdin
 raw = sys.stdin.read()
 raw_message = email.message_from_string( raw )
+
 from_addr = raw_message['From']
 to_addrs = list()
 encrypted_to_addrs = list()
-if raw_message.has_key('To'):
-	to_addrs.extend( [e[1] for e in email.utils.getaddresses([raw_message['To']])] )
-if raw_message.has_key('Cc'):
-	to_addrs.extend( [e[1] for e in email.utils.getaddresses([raw_message['Cc']])] )
-if raw_message.has_key('Bcc'):
-	to_addrs.extend( [e[1] for e in email.utils.getaddresses([raw_message['Bcc']])] )
-if raw_message.has_key('X-GPG-Encrypt-Cc'):
-        encrypted_to_addrs.extend( [e[1] for e in email.utils.getaddresses([raw_message['X-GPG-Encrypt-Cc']])] )
-	del raw_message['X-GPG-Encrypt-Cc']
+if raw_message.has_key('Delivered-To'):
+	to_addrs.extend( [e[1] for e in email.utils.getaddresses([raw_message['Delivered-To']])] )
+	del raw_message['Delivered-To']
+#if raw_message.has_key('To'):
+#	to_addrs.extend( [e[1] for e in email.utils.getaddresses([raw_message['To']])] )
+#if raw_message.has_key('Cc'):
+#	to_addrs.extend( [e[1] for e in email.utils.getaddresses([raw_message['Cc']])] )
+#if raw_message.has_key('Bcc'):
+#	to_addrs.extend( [e[1] for e in email.utils.getaddresses([raw_message['Bcc']])] )
+#if raw_message.has_key('X-GPG-Encrypt-Cc'):
+#        encrypted_to_addrs.extend( [e[1] for e in email.utils.getaddresses([raw_message['X-GPG-Encrypt-Cc']])] )
+#	del raw_message['X-GPG-Encrypt-Cc']
+
+def emit_log(message):
+	if cfg.has_key('logging') and cfg['logging'].has_key('file'):
+		message = message.rstrip()
+		log = open(cfg['logging']['file'], 'a')
+		log.write("%s\n" % (message))
+		log.close()
 
 def send_msg( message, recipients = None ):
-	if recipients == None:
+	if recipients == None or len(recipients) < 1:
+		emit_log("No recipients found for this message:\n%s" % message)
 		return
-	if cfg.has_key('logging') and cfg['logging'].has_key('file'):
-		log = open(cfg['logging']['file'], 'a')
-		log.write("Sending email to: <%s>\n" % '> <'.join( recipients ))
-		log.close()
+	emit_log("Sending email to: <%s>\n" % '> <'.join( recipients ))
 	relay = (cfg['relay']['host'], int(cfg['relay']['port']))
 	smtp = smtplib.SMTP(relay[0], relay[1])
 	smtp.sendmail( from_addr, recipients, message.as_string() )
@@ -77,40 +92,98 @@ def get_msg( message ):
 		return message.get_payload()
 	return '\n\n'.join( [str(m) for m in message.get_payload()] )
 
+
 keys = GnuPG.public_keys( cfg['gpg']['keyhome'] )
 gpg_to = list()
 ungpg_to = list()
+
+emit_log('encrypted recipients to process: %s' % ', '.join(encrypted_to_addrs))
 for enc in encrypted_to_addrs:
-	domain = enc.split('@')[1]
+	addr,domain = enc.split('@')
+	if recipient_delimiter is not None and recipient_delimiter in addr:
+		# we have a delimiter!
+		real_addr = addr.split(recipient_delimiter)[0] # only the left hand side
+		newenc = "%s@%s" % (real_addr,domain)
+	else:
+		newenc = enc
+
 	if domain in cfg['default']['domains'].split(','):
 		if enc in keys:
+			# if the key matches directly, we can encrypt to this address
+			emit_log("Adding encrypted recipient %s" % (enc))
 			gpg_to.append( (enc, enc) )
+
+		elif recipient_delimiter is not None and newenc in keys:
+			# if the decomposed key matches the address directly
+			emit_log("Adding encrypted and delimited recipient %s (%s)" %  (enc,newenc))
+			gpg_to.append( (enc, newenc) )
+
                 elif cfg.has_key('keymap') and cfg['keymap'].has_key(enc):
+			# if the key is in our keymap and we can relate it back to a key we know of, we can encrypt to this address
+			emit_log("Adding encrypted and mapped recipient %s (originally %s)" % (enc, cfg['keymap'][enc]))
                         gpg_to.append( (enc, cfg['keymap'][enc]) )
+
+		elif recipient_delimiter is not None and cfg.has_key('keymap') and cfg['keymap'].has_key(newenc):
+			# if the decomposed key matches something in our keymap
+			emit_log("Adding encrypted, mapped, delimited recipient %s (originally %s)" % (enc, cfg['keymap'][newenc]))
+			gpg_to.append( (enc, cfg['keymap'][newenc] ) )
 			
+		else:
+			emit_log("Not adding encrypted recipient %s" % (enc))
+
+	else:
+		emit_log("Recipient %s isn't in our list of domains (%s), ignoring." % (enc,cfg['default']['domains']))
+
+emit_log('unencrypted recipients to process: %s' % ', '.join(to_addrs))
+
 for to in to_addrs:
-	domain = to.split('@')[1]
+	addr,domain = to.split('@')
+	if recipient_delimiter is not None and recipient_delimiter in addr:
+		# we have a delimiter!
+		real_addr = addr.split(recipient_delimiter)[0] # only the left hand side
+		newto = "%s@%s" % (real_addr,domain)
+	else:
+		newto = to
+
 	if domain in cfg['default']['domains'].split(','):
 		if to in keys:
+			emit_log("Adding regular recipient %s" % (to))
 			gpg_to.append( (to, to) )
+		elif recipient_delimiter is not None and newto in keys:
+			emit_log("Adding delimited regular recipient %s (originally %s)" % (to,newto))
+			gpg_to.append( (to, newto) )
 		elif cfg.has_key('keymap') and cfg['keymap'].has_key(to):
+			emit_log("Adding mapped regular recipient %s (originally %s)" % (to,cfg['keymap'][to]))
 			gpg_to.append( (to, cfg['keymap'][to]) )
-	else:
-		ungpg_to.append(to)
+		elif recipient_delimiter is not None and cfg.has_key('keymap') and cfg['keymap'].has_key(newto):
+			emit_log("Adding delimited, mapped regular recipient %s (originally %s)" % (to,cfg['keymap'][newto]))
+			gpg_to.append( (to, cfg['keymap'][newto]) )
+		else:
+			emit_log("No key found for recipient %s, adding to non-encrypted recipients." % (to))
+			ungpg_to.append(to)
 
-if gpg_to == list():
+	else:
+		emit_log("Recipient %s isn't in our list of domains (%s), ignoring." % (to,cfg['default']['domains']))
+
+# if we have messages to encrypt to, send to them
+#if gpg_to == list():
+#	if cfg['default'].has_key('add_header') and cfg['default']['add_header'] == 'yes':
+#		raw_message['X-GPG-Mailgate'] = 'Not encrypted, public key not found'
+##	send_msg( raw_message, to_addrs )
+#	exit()
+
+# if we have messages that aren't to be encrypted to, send to them as well
+# first, log
+# then, send
+if ungpg_to != list():
 	if cfg['default'].has_key('add_header') and cfg['default']['add_header'] == 'yes':
 		raw_message['X-GPG-Mailgate'] = 'Not encrypted, public key not found'
-	send_msg( raw_message )
-	exit()
-
-if ungpg_to != list():
+	emit_log("Sending unencrypted email to: %s\n" % ' '.join( map(lambda x: x[0], ungpg_to) ))
 	send_msg( raw_message, ungpg_to )
+else:
+	emit_log("No unencrypted addresses to send to\n")
 
-if cfg.has_key('logging') and cfg['logging'].has_key('file'):
-	log = open(cfg['logging']['file'], 'a')
-	log.write("Encrypting email to: %s\n" % ' '.join( map(lambda x: x[0], gpg_to) ))
-	log.close()
+emit_log("Encrypting email to: %s\n" % ' '.join( map(lambda x: x[0], gpg_to) ))
 
 if cfg['default'].has_key('add_header') and cfg['default']['add_header'] == 'yes':
 	raw_message['X-GPG-Mailgate'] = 'Encrypted by GPG Mailgate'
